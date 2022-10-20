@@ -1,0 +1,32 @@
+[tool.poetry]
+name = "lithium"
+version = "0.1.0"
+description = "An SDS scraper to download thousands of SDS documents."
+authors = ["Dennis Pham <dennis@dennispham.me>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+aiofiles = "^22.1.0"
+beautifulsoup4 = "^4.11.1"
+httpx = "^0.23.0"
+more-itertools = "^9.0.0"
+
+[tool.poetry.group.dev.dependencies]
+taskipy = "^1.10.3"
+flake8 = "^5.0.4"
+pre-commit = "^2.20.0"
+Flake8-pyproject = "^1.1.0.post0"
+
+[tool.flake8]
+max-line-length = 99
+
+[tool.taskipy.tasks]
+start = "python -m lithium"
+lint = "flake8 ."
+pre-commit = "pre-commit install"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
