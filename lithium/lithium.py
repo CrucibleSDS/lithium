@@ -37,6 +37,8 @@ class Lithium:
     async def get_cas_numbers(self):
         res = await self.httpx.get(
             "https://en.wikipedia.org/wiki/List_of_CAS_numbers_by_chemical_compound",
+            headers={"User-Agent": USER_AGENT},
+            timeout=self.timeout,
         )
         soup = BeautifulSoup(res.text, "html.parser")
 
