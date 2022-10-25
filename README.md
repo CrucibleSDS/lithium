@@ -1,5 +1,5 @@
 <div align="center">
-    <img src="https://raw.githubusercontent.com/Den4200/lithium/main/assets/lithium-wide-dark-bg-pad.png" align="center" alt="Lithium" />
+    <img src="assets/lithium-wide-dark-bg-pad.png" align="center" alt="Lithium" />
     <h1 align="center">Lithium</h1>
     <p align="center">An SDS scraper to download thousands of SDS documents.</p>
 </div>
