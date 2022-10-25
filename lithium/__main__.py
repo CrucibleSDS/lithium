@@ -11,7 +11,7 @@ async def main():
         # await lithium.download_sds_by_cas_number("7732-18-5", "./output")
         await lithium.download_all_sds("./output", print_progress=True, chunks=64)
 
-    print(time.perf_counter() - start)
+    print(time.perf_counter() - start, "seconds elapsed")
 
 
 if __name__ == "__main__":
