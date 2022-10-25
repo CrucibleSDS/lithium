@@ -1,7 +1,8 @@
 import asyncio
 from os import PathLike
 from pathlib import Path
-from typing import Optional
+from types import TracebackType
+from typing import Optional, Type
 
 import aiofiles
 from bs4 import BeautifulSoup
@@ -20,7 +21,12 @@ class Lithium:
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[TracebackType]
+    ):
         await self.close()
 
     async def close(self):
