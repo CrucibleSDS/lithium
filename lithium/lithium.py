@@ -1,24 +1,73 @@
 import asyncio
+from contextlib import suppress
 from importlib.metadata import version
+import json
 from os import PathLike
 from pathlib import Path
+import random
+from string import ascii_letters
+from tqdm import tqdm
+from tqdm.asyncio import tqdm_asyncio
 from types import TracebackType
 from typing import Optional, Type
 
 import aiofiles
-from bs4 import BeautifulSoup
+from aiofiles.threadpool.text import AsyncTextIOWrapper
 from httpx import AsyncClient
 from more_itertools import chunked, collapse
 
-SIGMA_ALDRICH_CAS_NUMBER_SEARCH_QUERY = "query ProductSearch($searchTerm: String, $page: Int!, $sort: Sort, $group: ProductSearchGroup, $selectedFacets: [FacetInput!], $type: ProductSearchType, $catalogType: CatalogType, $orgId: String, $region: String, $facetSet: [String]) {\n  getProductSearchResults(input: {searchTerm: $searchTerm, pagination: {page: $page}, sort: $sort, group: $group, facets: $selectedFacets, type: $type, catalogType: $catalogType, orgId: $orgId, region: $region, facetSet: $facetSet}) {\n    ...ProductSearchFields\n    __typename\n  }\n}\n\nfragment ProductSearchFields on ProductSearchResults {\n  metadata {\n    itemCount\n    setsCount\n    page\n    perPage\n    numPages\n    redirect\n    __typename\n  }\n  items {\n    ... on Substance {\n      ...SubstanceFields\n      __typename\n    }\n    ... on Product {\n      ...SubstanceProductFields\n      __typename\n    }\n    __typename\n  }\n  facets {\n    key\n    numToDisplay\n    isHidden\n    isCollapsed\n    multiSelect\n    prefix\n    options {\n      value\n      count\n      __typename\n    }\n    __typename\n  }\n  didYouMeanTerms {\n    term\n    count\n    __typename\n  }\n  __typename\n}\n\nfragment SubstanceFields on Substance {\n  _id\n  id\n  name\n  synonyms\n  empiricalFormula\n  linearFormula\n  molecularWeight\n  aliases {\n    key\n    label\n    value\n    __typename\n  }\n  images {\n    sequence\n    altText\n    smallUrl\n    mediumUrl\n    largeUrl\n    brandKey\n    productKey\n    label\n    __typename\n  }\n  casNumber\n  products {\n    ...SubstanceProductFields\n    __typename\n  }\n  match_fields\n  __typename\n}\n\nfragment SubstanceProductFields on Product {\n  name\n  productNumber\n  productKey\n  isSial\n  isMarketplace\n  marketplaceSellerId\n  marketplaceOfferId\n  cardCategory\n  cardAttribute {\n    citationCount\n    application\n    __typename\n  }\n  substance {\n    id\n    __typename\n  }\n  casNumber\n  attributes {\n    key\n    label\n    values\n    __typename\n  }\n  speciesReactivity\n  brand {\n    key\n    erpKey\n    name\n    color\n    __typename\n  }\n  images {\n    altText\n    smallUrl\n    mediumUrl\n    largeUrl\n    __typename\n  }\n  description\n  sdsLanguages\n  sdsPnoKey\n  similarity\n  paMessage\n  features\n  catalogId\n  materialIds\n  __typename\n}\n"  # noqa: E501
+WIKIDATA_CAS_NUMBER_QUERY_URL = (
+    "https://query.wikidata.org/sparql?format=json&query=SELECT%20DISTINCT%20%3F"
+    "casNumber%20WHERE%20%7B%0A%20%20%3Fitem%20wdt%3AP231%20%3FcasNumber.%0A%7D%"
+    "0AORDER%20BY%20%3FcasNumber"
+)
+SIGMA_ALDRICH_CAS_NUMBER_SEARCH_QUERY = """\
+  {key}: getProductSearchResults(input: {{
+    searchTerm: "{cas_number}",
+    pagination: {{page: 1, perPage: 1000000}},
+    sort: relevance,
+    group: product,
+    facets: [],
+    type: CAS_NUMBER
+  }}) {{
+    items {{
+      ... on Product {{
+        name
+        productKey
+        casNumber
+        brand {{
+          key
+        }}
+        images {{
+          largeUrl
+        }}
+      }}
+    }}
+  }}
+"""
+SIGMA_ALDRICH_SDS_BASE_URL = "https://www.sigmaaldrich.com/US/en/sds"
 USER_AGENT = f"Lithium {version('lithium')}"
 
 
 class Lithium:
 
-    def __init__(self, *, httpx_client: Optional[AsyncClient] = None, timeout: int = 300) -> None:
+    def __init__(
+        self,
+        *,
+        httpx_client: Optional[AsyncClient] = None,
+        timeout: int = 300,
+        max_retries: int = 5,
+        lithium_dir: PathLike = ".lithium",
+    ) -> None:
         self.httpx = httpx_client or AsyncClient()
         self.timeout = timeout
+        self.max_retries = max_retries
+
+        self.lithium_dir = Path(lithium_dir)
+        self.lithium_dir.mkdir(exist_ok=True)
+        (self.lithium_dir / "cache").mkdir(exist_ok=True)
+
+        self._keys = set()
 
     async def __aenter__(self):
         return self
@@ -36,58 +85,91 @@ class Lithium:
 
     async def get_cas_numbers(self):
         res = await self.httpx.get(
-            "https://en.wikipedia.org/wiki/List_of_CAS_numbers_by_chemical_compound",
+            WIKIDATA_CAS_NUMBER_QUERY_URL,
             headers={"User-Agent": USER_AGENT},
             timeout=self.timeout,
         )
-        soup = BeautifulSoup(res.text, "html.parser")
+        res.raise_for_status()
 
-        return [
-            cas_number
-            for tbody in soup.find_all("tbody")
-            for tr in tbody.find_all("tr")[1:]
-            if (cas_number := tr.find_all("td")[2].string.strip())
-        ]
+        data = res.json()
+        return [cas_number["casNumber"]["value"] for cas_number in data["results"]["bindings"]]
 
-    async def search_cas_number(self, cas_number: str):
-        res = await self.httpx.post(
-            "https://www.sigmaaldrich.com/api",
-            headers={"User-Agent": USER_AGENT, "x-gql-country": "US", "x-gql-language": "en"},
-            json={
-                "operationName": "ProductSearch",
-                "query": SIGMA_ALDRICH_CAS_NUMBER_SEARCH_QUERY,
-                "variables": {
-                    "group": "product",
-                    "page": 1,
-                    "searchTerm": cas_number,
-                    "selectedFacets": [],
-                    "sort": "relevance",
-                    "type": "CAS_NUMBER",
-                },
-            },
-            timeout=self.timeout,
+    def generate_key(self) -> str:
+        while (key := "".join(random.sample(ascii_letters, len(ascii_letters)))) in self._keys:
+            self._keys.add(key)
+
+        return key
+
+    def build_query(self, *cas_numbers: list[str]) -> str:
+        content = "".join(
+            SIGMA_ALDRICH_CAS_NUMBER_SEARCH_QUERY.format(
+                key=self.generate_key(),
+                cas_number=cas_number
+            )
+            for cas_number in cas_numbers
         )
+        return f"query {{\n{content}}}"
+
+    async def search_cas_numbers(self, *cas_numbers: list[str]) -> list[dict[str, str]] | None:
+        for _ in range(self.max_retries):
+            with suppress(Exception):
+                res = await self.httpx.post(
+                    "https://www.sigmaaldrich.com/api",
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "x-gql-country": "US",
+                        "x-gql-language": "en",
+                    },
+                    json={
+                        "query": self.build_query(*cas_numbers),
+                        "variables": None,
+                    },
+                    timeout=self.timeout,
+                )
+                res.raise_for_status()
+
+                if res.status_code == 200:
+                    break
+        else:
+            return None
+
+        data = res.json()["data"]
+        if data is None:
+            return []
 
         return [
             {
+                "name": item["name"],
                 "brand": item["brand"]["key"],
-                "product_number": item["sdsPnoKey"],
+                "product_number": item["productKey"],
                 "cas_number": item["casNumber"]
             }
-            for item in res.json()["data"]["getProductSearchResults"]["items"]
+            for cas_number_entry in data.values()
+            for item in cas_number_entry["items"]
             if item["casNumber"] is not None
         ]
 
-    async def download_single_sds(self, sds: dict[str, str], output: PathLike):
-        async with self.httpx.stream(
-            "GET",
-            f"https://www.sigmaaldrich.com/US/en/sds/{sds['brand']}/{sds['product_number']}",
-            headers={"User-Agent": USER_AGENT},
-            timeout=self.timeout,
-        ) as res:
-            async with aiofiles.open(output, "wb") as f:
-                async for chunk in res.aiter_bytes():
-                    await f.write(chunk)
+    async def download_single_sds(self, sds: dict[str, str], output: PathLike) -> int:
+        status_code = -1
+        for _ in range(self.max_retries):
+            with suppress(Exception):
+                async with self.httpx.stream(
+                    "GET",
+                    f"{SIGMA_ALDRICH_SDS_BASE_URL}/{sds['brand']}/{sds['product_number']}",
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=self.timeout,
+                ) as res:
+                    status_code = res.status_code
+                    if status_code != 200:
+                        continue
+
+                    async with aiofiles.open(output, "wb") as f:
+                        async for chunk in res.aiter_bytes():
+                            await f.write(chunk)
+
+                    return status_code
+
+        return status_code
 
     async def download_sds_by_cas_number(self, cas_number: str, output_dir: PathLike):
         output = Path(output_dir) / cas_number
@@ -100,41 +182,78 @@ class Lithium:
             for sds in sds_data
         ))
 
-    def _download_single_sds_with_dir(self, sds: dict[str, str], output: Path):
+    async def _download_single_sds_with_dir(
+        self,
+        sds: dict[str, str],
+        output: Path,
+        f: AsyncTextIOWrapper,
+    ):
         output.parent.mkdir(exist_ok=True, parents=True)
-        return self.download_single_sds(sds, output)
+        if (status := await self.download_single_sds(sds, output)) != 200:
+            await f.write(json.dumps({"status": status, **sds}) + "\n")
+            await f.flush()
 
     async def download_all_sds(
         self,
         output_dir: PathLike,
         *,
+        metadata_cache_file: PathLike = ".lithium/cache/sds.json",
+        cas_cache_file: PathLike = ".lithium/cache/cas.json",
         print_progress: bool = False,
-        chunks: int = 64
+        metadata_chunk_size: int = 256,
+        download_chunk_size: int = 64,
     ):
         output = Path(output_dir)
         output.mkdir(exist_ok=True)
 
-        if print_progress:
-            print("Gathering SDS sources..")
+        if Path(metadata_cache_file).exists():
+            print("Loading cached metadata..")
+            async with aiofiles.open(metadata_cache_file, "r") as f:
+                sds_data = json.loads(await f.read())
+        else:
+            if print_progress:
+                print("Fetching SDS metadata..")
 
-        sds_data = [
-            await asyncio.gather(*(
-                self.search_cas_number(cas_number)
-                for cas_number in cas_numbers
-            ))
-            for cas_numbers in chunked(await self.get_cas_numbers(), chunks)
-        ]
+            if Path(cas_cache_file).exists():
+                async with aiofiles.open(cas_cache_file, "r") as f:
+                    cas_numbers = json.loads(await f.read())
+            else:
+                cas_numbers = await self.get_cas_numbers()
+                async with aiofiles.open(cas_cache_file, "w") as f:
+                    await f.write(json.dumps(cas_numbers))
 
-        downloaded = 0
-        for sds_batch in chunked(collapse(sds_data, base_type=dict), chunks):
-            await asyncio.gather(*(
-                self._download_single_sds_with_dir(
-                    sds,
-                    output / sds["cas_number"] / f"{sds['brand']}_{sds['product_number']}.pdf"
-                )
-                for sds in sds_batch
-            ))
+            sds_data_tasks = [
+                self.search_cas_numbers(*chunk)
+                for chunk in chunked(cas_numbers, metadata_chunk_size)
+            ]
 
             if print_progress:
-                downloaded += len(sds_batch)
-                print(f"{downloaded} documents downloaded..")
+                sds_data_tasks = tqdm(sds_data_tasks)
+
+            sds_data = [*collapse([await task for task in sds_data_tasks], base_type=dict)]
+
+            async with aiofiles.open(metadata_cache_file, "w") as f:
+                await f.write(json.dumps(sds_data))
+
+        if print_progress:
+            print("Downloading SDS documents..")
+
+        chunked_data = [
+            (
+                (sds, output / sds["cas_number"] / f"{sds['brand']}_{sds['product_number']}.pdf")
+                for sds in sds_batch
+            )
+            for sds_batch in chunked(sds_data, download_chunk_size)
+        ]
+
+        if print_progress:
+            chunked_data = tqdm(chunked_data, desc="Overall Pr")
+
+        async with aiofiles.open(self.lithium_dir / "error.log", "w") as f:
+            for i, chunk in enumerate(chunked_data):
+                await tqdm_asyncio.gather(*(
+                        self._download_single_sds_with_dir(*args, f) for args in chunk
+                    ),
+                    leave=False,
+                    desc=f"Chunk {i + 1:04}"
+                )

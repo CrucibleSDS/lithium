@@ -12,6 +12,7 @@ aiofiles = "^22.1.0"
 beautifulsoup4 = "^4.11.1"
 httpx = "^0.23.0"
 more-itertools = "^9.0.0"
+tqdm = "^4.65.0"
 
 [tool.poetry.group.dev.dependencies]
 taskipy = "^1.10.3"
